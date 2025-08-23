@@ -2633,3 +2633,32 @@ void video_set_dirty_area(int x, int y, int w, int h)
 
 	// XXX handle dirty bounding boxes for non-VOSF modes
 }
+
+#ifdef LIBRETRO
+#include "libretro_bridge.h"
+#include <stdint.h>
+
+/* After the framebuffer is unlocked, submit a copy (or the direct buffer) to the bridge.
+ * Prefer submitting the actual framebuffer pointer if it's stable until next write,
+ * otherwise copy into a temporary buffer first and pass that pointer (but avoid extra copies).
+ *
+ * We'll use the bridge's store function which copies the frame into the bridge-owned buffer.
+ */
+
+{
+    extern video_mode VModes[]; /* existing definition in video_x.cpp */
+    int width = VModes[cur_mode].viXsize;
+    int height = VModes[cur_mode].viYsize;
+    int row_bytes = VModes[cur_mode].viRowBytes;
+    int bytes_per_pixel = row_bytes / width; /* integer truncation: prefer explicit pixel size if available */
+
+    /* screen_base is the framebuffer pointer used by SheepShaver */
+    const void *src_ptr = (const void *)screen_base;
+
+    /* Submit to bridge - bridge will copy/convert into its internal RGBA buffer */
+    /* src_pixel_size = bytes_per_pixel (commonly 4) */
+    video_libretro_submit_frame_raw(src_ptr, (unsigned)width, (unsigned)height, (size_t)row_bytes, (unsigned)bytes_per_pixel);
+
+    /* No need to call sheepbridge_signal_frame() — store_frame signals already. */
+}
+#endif /* LIBRETRO */

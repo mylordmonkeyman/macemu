@@ -1,35 +1,29 @@
 /*
- * Small helpers for platform video code.
+ * Small helper for video backend to call into bridge.
  *
- * The platform backend should:
- *  1) Prepare a final 32-bit pixel buffer (RGBA/native) for the frame.
- *  2) Call sheepbridge_submit_frame(buf, w, h, pitch);
- *  3) Immediately call sheepbridge_signal_frame();
+ * Video backend should:
+ *  - Prepare/convert the source framebuffer into a contiguous pointer 'src'
+ *    with known src_pixel_size and src_pitch.
+ *  - Call sheepbridge_store_frame(src, width, height, src_pitch, src_pixel_size);
+ *  - Optionally call sheepbridge_signal_frame() (store_frame already signals).
  *
- * If the platform provides frames in a non-32-bit format, convert once here
- * or convert in the platform code ahead of calling submit_frame.
+ * Keep this helper simple — it just forwards to the bridge.
  */
 
 #include "libretro_bridge.h"
 #include <cstdint>
-#include <cstdlib>
-#include <cstring>
-
-/* This file intentionally small — it only provides helper stubs. Prefer calling
- * sheepbridge_submit_frame() directly from the platform backend once it has
- * assembled the final framebuffer.
- */
+#include <cstddef>
 
 extern "C" {
 
-/* If you want a convenience function that converts from SheepShaver's internal
- * framebuffer layout to 32-bit RGBA, implement it here and call it from video_x.cpp.
- *
- * Example signature:
- *   void video_libretro_submit_converted(const uint8_t *src, unsigned w, unsigned h, unsigned src_pitch);
- *
- * For simplicity we don't add conversions here; do the conversion in the caller
- * and call sheepbridge_submit_frame directly.
+/* Convenience wrapper: submit raw frame pointer (no conversion); src_pixel_size in bytes */
+void video_libretro_submit_frame_raw(const void *src, unsigned width, unsigned height, size_t src_pitch, unsigned src_pixel_size)
+{
+    sheepbridge_store_frame(src, width, height, src_pitch, src_pixel_size);
+}
+
+/* Convenience wrapper: if your platform has 'screen_base' and VModes[] info, call this
+ * from video_x.cpp as video_libretro_submit_frame_raw(screen_base, w, h, row_bytes, bytes_per_pixel).
  */
 
 } /* extern C */
