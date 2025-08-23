@@ -1,0 +1,52 @@
+GUI         := $(CORE_DIR)/libretro/nukleargui
+
+INCFLAGS    :=  \
+				 -I$(CORE_DIR)/minivmac/src \
+				 -I$(CORE_DIR)/minivmac/cfg \
+				 -I$(CORE_DIR)/libretro \
+				 -I$(CORE_DIR)/libretro/include \
+				 -I$(CORE_DIR)/libretro-common/include \
+				 -I$(GUI) \
+				 -I$(GUI)/nuklear \
+				 -I$(GUI)/retro
+
+SOURCES_C   := \
+				 $(CORE_DIR)/minivmac/src/MINEM68K.c \
+				 $(CORE_DIR)/minivmac/src/GLOBGLUE.c \
+				 $(CORE_DIR)/minivmac/src/M68KITAB.c \
+				 $(CORE_DIR)/minivmac/src/VIAEMDEV.c \
+				 $(CORE_DIR)/minivmac/src/VIA2EMDV.c \
+				 $(CORE_DIR)/minivmac/src/IWMEMDEV.c \
+				 $(CORE_DIR)/minivmac/src/SCCEMDEV.c \
+				 $(CORE_DIR)/minivmac/src/RTCEMDEV.c \
+				 $(CORE_DIR)/minivmac/src/ROMEMDEV.c \
+				 $(CORE_DIR)/minivmac/src/SCSIEMDV.c \
+				 $(CORE_DIR)/minivmac/src/SONYEMDV.c \
+				 $(CORE_DIR)/minivmac/src/SCRNEMDV.c \
+				 $(CORE_DIR)/minivmac/src/VIDEMDEV.c \
+				 $(CORE_DIR)/minivmac/src/ADBEMDEV.c \
+				 $(CORE_DIR)/minivmac/src/ASCEMDEV.c \
+				 $(CORE_DIR)/minivmac/src/MOUSEMDV.c \
+				 $(CORE_DIR)/minivmac/src/PROGMAIN.c \
+				 $(CORE_DIR)/minivmac/src/OSGLUERETRO.c \
+				 $(CORE_DIR)/libretro/libretro-core.c \
+				 $(CORE_DIR)/libretro/retrostubs.c \
+				 $(GUI)/retro/SDL_gfxPrimitives.c \
+				 $(GUI)/retro/retro_surface.c  \
+				 $(GUI)/app.c
+
+ifneq ($(STATIC_LINKING), 1)
+SOURCES_C +=  \
+	  $(CORE_DIR)/libretro-common/compat/compat_posix_string.c \
+	  $(CORE_DIR)/libretro-common/compat/compat_snprintf.c \
+	  $(CORE_DIR)/libretro-common/compat/compat_strl.c \
+	  $(CORE_DIR)/libretro-common/compat/fopen_utf8.c \
+	  $(CORE_DIR)/libretro-common/encodings/encoding_utf.c \
+  	  $(CORE_DIR)/libretro-common/file/file_path.c \
+	  $(CORE_DIR)/libretro-common/file/retro_dirent.c \
+	  $(CORE_DIR)/libretro-common/time/rtime.c \
+	  $(CORE_DIR)/libretro-common/streams/file_stream.c \
+	  $(CORE_DIR)/libretro-common/string/stdstring.c \
+	  $(CORE_DIR)/libretro-common/vfs/vfs_implementation.c
+
+endif
