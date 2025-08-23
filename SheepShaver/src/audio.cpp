@@ -37,6 +37,24 @@
 #define DEBUG 0
 #include "debug.h"
 
+#ifdef LIBRETRO
+#include "Unix/audio_libretro_shim.h"
+#include "Unix/libretro_bridge.h" /* sheepbridge_set_sample_rate */
+#endif
+
+#ifdef LIBRETRO
+/* Inform libretro bridge of the sample rate in Hz (convert fixed point if needed).
+ * If AudioStatus.sample_rate is a fixed-point Q16 value (44100 << 16), convert:
+ */
+#ifndef AUDIO_SAMPLE_RATE_IS_PLAIN
+/* If stored as 16.16 fixed point (common in this codebase), fix like this: */
+unsigned libretro_rate = (unsigned)(AudioStatus.sample_rate >> 16);
+#else
+unsigned libretro_rate = (unsigned) AudioStatus.sample_rate;
+#endif
+sheepbridge_set_sample_rate(libretro_rate);
+#endif
+
 
 // Supported sample rates, sizes and channels
 vector<uint32> audio_sample_rates;

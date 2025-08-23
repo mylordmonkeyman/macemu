@@ -8,18 +8,18 @@
 extern "C" {
 #endif
 
-/* Send audio to libretro bridge.
- * - samples_or_buf: pointer to the frame buffer (format described by sample_size and channels)
+/* Convert-and-forward helper for libretro builds.
+ * - buf: input samples
  * - frames: number of frames (one frame = one sample per channel)
  * - sample_size: bytes per sample per channel (1,2,4)
- * - channels: channel count in input data (1 or 2)
+ * - channels: number of channels in input (1 or 2)
  *
- * This function will convert to signed int16 interleaved stereo if necessary
- * and call sheepbridge_store_audio_samples() when built with -DLIBRETRO.
+ * This converts many common formats to signed 16-bit interleaved stereo
+ * and forwards to sheepbridge_store_audio_samples() when compiled with -DLIBRETRO.
  */
-void send_audio_to_host(const void *samples_or_buf, size_t frames, int sample_size, int channels);
+void send_audio_to_host(const void *buf, size_t frames, int sample_size, int channels);
 
-/* Convenience wrapper for already-s16-stereo buffers */
+/* Fast path if you already have s16 interleaved stereo frames */
 void send_s16_stereo_to_host(const int16_t *samples, size_t frames);
 
 #ifdef __cplusplus

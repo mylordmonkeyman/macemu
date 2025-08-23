@@ -8,28 +8,27 @@
 #include <string.h>
 #include <stdint.h>
 
-/* Convert and forward to bridge. Keep conversions simple and robust. */
+/* Convert and forward */
 void send_audio_to_host(const void *buf, size_t frames, int sample_size, int channels)
 {
     if (!buf || frames == 0) return;
 
 #ifdef LIBRETRO
-    /* We will produce int16_t interleaved stereo for the bridge. */
+    /* Output must be s16 interleaved stereo */
     size_t out_samples = frames * 2; /* stereo -> 2 samples per frame */
     int16_t *out = (int16_t*)malloc(out_samples * sizeof(int16_t));
     if (!out) return;
 
     if (sample_size == 2 && channels == 2) {
-        /* Input already s16 stereo; may be native-endian. If endianness issues appear,
-           add byte-swap here. We can pass it straight through */
+        /* likely already s16 stereo: copy directly */
         memcpy(out, buf, out_samples * sizeof(int16_t));
     } else if (sample_size == 2 && channels == 1) {
-        /* s16 mono -> stereo duplicate */
+        /* s16 mono -> duplicate to stereo */
         const int16_t *in = (const int16_t *)buf;
         for (size_t f = 0; f < frames; ++f) {
-            int16_t s = in[f];
-            out[2*f] = s;
-            out[2*f + 1] = s;
+            int16_t v = in[f];
+            out[2*f] = v;
+            out[2*f + 1] = v;
         }
     } else if (sample_size == 4 && channels == 2) {
         /* float32 stereo -> s16 stereo */
@@ -53,15 +52,15 @@ void send_audio_to_host(const void *buf, size_t frames, int sample_size, int cha
             out[2*f + 1] = v;
         }
     } else if (sample_size == 1) {
-        /* 8-bit unsigned mono/stereo -> s16 stereo */
+        /* 8-bit unsigned to signed 16-bit stereo */
         if (channels == 1) {
             const uint8_t *in = (const uint8_t *)buf;
             for (size_t f = 0; f < frames; ++f) {
-                int16_t v = (int16_t)((int)in[f] - 128) << 8;
+                int16_t v = ((int)in[f] - 128) << 8;
                 out[2*f] = v;
                 out[2*f + 1] = v;
             }
-        } else { /* 8-bit stereo */
+        } else {
             const uint8_t *in = (const uint8_t *)buf;
             for (size_t f = 0; f < frames; ++f) {
                 int16_t l = ((int)in[2*f] - 128) << 8;
@@ -71,15 +70,14 @@ void send_audio_to_host(const void *buf, size_t frames, int sample_size, int cha
             }
         }
     } else {
-        /* Unknown format - fallback: silence */
+        /* Unknown format: produce silence to avoid undefined behavior */
         memset(out, 0, out_samples * sizeof(int16_t));
     }
 
-    /* Forward to bridge */
+    /* Forward to libretro bridge */
     sheepbridge_store_audio_samples(out, frames);
     free(out);
 #else
-    /* Non-LIBRETRO builds: nothing here. Actual device write should happen elsewhere. */
     (void)buf; (void)frames; (void)sample_size; (void)channels;
 #endif
 }
