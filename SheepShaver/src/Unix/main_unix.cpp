@@ -382,6 +382,42 @@ static inline int vm_mac_release(uint32 addr, uint32 size)
  *  Main program
  */
 
+bool Unix_SheepShaver_Init(const char *rom_path, const char *vmdir, unsigned int ram_mb)
+{
+    char str[256];
+    // map RAM area (existing code)
+    // ... copy the block that currently creates RAM/ROM areas and calls SheepMem::Init()
+    if (!SheepMem::Init()) {
+        sprintf(str, GetString(STR_SHEEP_MEM_MMAP_ERR), strerror(errno));
+        ErrorAlert(str);
+        return false;
+    }
+    // Load Mac ROM
+    if (!load_mac_rom(rom_path)) {
+        return false;
+    }
+    // Initialize everything
+    if (!InitAll(vmdir)) {
+        return false;
+    }
+    // write-protect ROM, flush caches if needed
+    vm_protect(ROMBaseHost, ROM_AREA_SIZE, VM_PAGE_READ | VM_PAGE_EXECUTE);
+    // Start tick and nvram threads (store their thread handles in globals)
+    tick_thread_cancel = false;
+    tick_thread_active = (pthread_create(&tick_thread, NULL, tick_func, NULL) == 0);
+    nvram_thread_cancel = false;
+    nvram_thread_active = (pthread_create(&nvram_thread, NULL, nvram_func, NULL) == 0);
+    return true;
+}
+
+bool Unix_SheepShaver_StartEmulationThread(void)
+{
+    // Launch the emulator thread that runs the Mac code (platform emul_func or jump_to_rom)
+    emul_thread_cancel = false;
+    emul_thread_active = (pthread_create(&emul_thread, NULL, emul_func, NULL) == 0);
+    return emul_thread_active;
+}
+
 static void usage(const char *prg_name)
 {
 	printf("Usage: %s [OPTION...]\n", prg_name);
