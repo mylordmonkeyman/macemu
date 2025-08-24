@@ -24,20 +24,23 @@ void sheepbridge_signal_frame(void);
 /* Audio callbacks: bridge will buffer audio pushed by platform backends.
  * - samples: pointer to signed 16-bit interleaved stereo samples (L R L R ...)
  * - frames: number of sample frames (one frame = 2 samples for stereo)
- *
- * The audio backend should convert its native audio format to signed 16-bit
- * interleaved stereo before calling this function. If it cannot, implement a
- * conversion wrapper in the backend and call this function with converted data.
  */
 void sheepbridge_set_audio_cb(retro_audio_sample_t cb, retro_audio_sample_batch_t cb_batch);
-
-/* Push a batch of signed 16-bit stereo samples into the bridge buffer.
- * Called by platform audio code (audio thread).
- */
 void sheepbridge_store_audio_samples(const int16_t *samples, size_t frames);
-
-/* Optionally set sample rate (defaults to 44100). Use to inform frontend via environ */
 void sheepbridge_set_sample_rate(unsigned rate);
+
+/* Input helper: the libretro wrapper will call sheepbridge_set_input_cb() with
+ * the libretro poll/state callbacks. The bridge will poll and forward selected
+ * input state into SheepShaver each frame.
+ *
+ * These are exposed so platform backends (or the wrapper) can also inject
+ * input directly if desired.
+ */
+
+/* (The function below is set via sheepbridge_set_input_cb by the wrapper.
+   Keep the prototype here for completeness.) */
+void sheepbridge_inject_key(bool down, int mac_keycode);
+void sheepbridge_inject_mouse(int x, int y, unsigned buttons_mask);
 
 #ifdef __cplusplus
 }
