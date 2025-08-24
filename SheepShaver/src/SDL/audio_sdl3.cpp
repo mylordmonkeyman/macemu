@@ -21,6 +21,12 @@
 #include "sysdeps.h"
 
 #include "my_sdl.h"
+
+#ifdef LIBRETRO
+#include "../Unix/audio_libretro_shim.h"
+#include "../Unix/libretro_bridge.h"
+#endif
+
 #if SDL_VERSION_ATLEAST(3, 0, 0)
 
 #include "cpu_emulation.h"
@@ -121,6 +127,29 @@ static bool open_sdl_audio(void)
 
 	assert(!main_open_sdl_stream);
 
+#ifdef LIBRETRO
+	/* LIBRETRO: do not open native SDL audio device. Inform bridge & allocate buffer */
+	sheepbridge_set_sample_rate((unsigned)audio_spec.freq);
+	main_open_sdl_stream = NULL;
+	silence_byte = SDL_GetSilenceValueForFormat(audio_spec.format);
+	audio_frames_per_block = audio_spec.samples;
+	/* audio_spec.size not directly exposed; compute roughly: samples * channels * bytes_per_sample */
+	int bits = SDL_AUDIO_BITSIZE(audio_spec.format);
+	int sample_size_bytes = bits / 8;
+	size_t bufsize = (size_t)audio_spec.samples * (size_t)audio_spec.channels * (size_t)sample_size_bytes;
+	audio_mix_buf = (uint8*)malloc(bufsize);
+	if (!audio_mix_buf) {
+		fprintf(stderr, "WARNING: Cannot allocate audio_mix_buf\n");
+		return false;
+	}
+#if defined(BINCUE)
+	OpenAudio_bincue(audio_spec.freq, audio_spec.format, audio_spec.channels, silence_byte, (int)(get_audio_volume()*128));
+#endif
+	printf("Using LIBRETRO audio output (SDL3 shim), freq %d chan %d\n", audio_spec.freq, audio_spec.channels);
+	audio_frames_per_block = 4096 >> PrefsFindInt32("sound_buffer");
+	start_threads();
+	return true;
+#else
 	// Open the audio device, forcing the desired format
 	SDL_AudioStream *stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &audio_spec, stream_func, NULL);
 	if (stream == NULL) {
@@ -138,6 +167,7 @@ static bool open_sdl_audio(void)
 	start_threads();
 	SDL_ResumeAudioDevice(SDL_GetAudioStreamDevice(stream));
 	return true;
+#endif
 }
 
 static void start_threads() {
@@ -356,15 +386,8 @@ static int interrupt_thread_func(void *data)
 			}
 		}
 	}
-
-	// Audio isn't active or the mac doesn't have any right now.
-	// Wait a little while.
-	SDL_Delay(INTERRUPT_RETRY_MS);
-
-	} // while
-	return 0;
-}
-
+	
+	// continuation of audio_sdl3.cpp (stream callback + remainder)
 static void SDLCALL stream_func(void *, SDL_AudioStream *stream, int stream_len, int total_amount)
 {
 	int target_queue_size;
@@ -409,13 +432,30 @@ static void SDLCALL stream_func(void *, SDL_AudioStream *stream, int stream_len,
 	memset(dst, silence_byte, stream_len);
 	//SDL_AudioSpec audio_spec;
 	//int r = SDL_GetAudioStreamFormat(stream, NULL, &audio_spec);// little endianが帰ってくる
+
+#ifdef LIBRETRO
+	SDL_MixAudio(dst, src, audio_spec.format, stream_len, get_audio_volume());
+#if defined(BINCUE)
+	MixAudio_bincue(dst, stream_len);
+#endif
+	int bits = SDL_AUDIO_BITSIZE(audio_spec.format);
+	int sample_size_bytes = bits / 8;
+	int channels = audio_spec.channels;
+	if (sample_size_bytes <= 0) sample_size_bytes = 2;
+	size_t frames = (size_t)stream_len / ((size_t)sample_size_bytes * (size_t)channels);
+	if (sample_size_bytes == 2 && channels == 2) {
+		send_s16_stereo_to_host((const int16_t *)dst, frames);
+	} else {
+		send_audio_to_host(dst, frames, sample_size_bytes, channels);
+	}
+#else
 	SDL_MixAudio(dst, src, audio_spec.format, stream_len, get_audio_volume());
 #if defined(BINCUE)
 	MixAudio_bincue(dst, stream_len);
 #endif
 	SDL_PutAudioStreamData(stream, dst, stream_len);
+#endif
 }
-
 
 /*
  *  MacOS audio interrupt, read next data block
@@ -439,7 +479,6 @@ void AudioInterrupt(void)
 	SDL_SignalSemaphore(audio_irq_done_sem);
 	D(bug("AudioInterrupt done\n"));
 }
-
 
 /*
  *  Set sampling parameters
@@ -467,7 +506,6 @@ bool audio_set_channels(int index)
 	audio_channel_count_index = index;
 	return open_audio();
 }
-
 
 /*
  *  Get/set volume controls (volume values received/returned have the left channel

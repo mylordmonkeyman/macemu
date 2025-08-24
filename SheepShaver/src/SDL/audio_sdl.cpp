@@ -21,6 +21,12 @@
 #include "sysdeps.h"
 
 #include "my_sdl.h"
+
+#ifdef LIBRETRO
+#include "../Unix/audio_libretro_shim.h"
+#include "../Unix/libretro_bridge.h"
+#endif
+
 #if !SDL_VERSION_ATLEAST(3, 0, 0)
 
 #include "cpu_emulation.h"
@@ -99,6 +105,21 @@ static bool open_sdl_audio(void)
 	audio_spec.callback = stream_func;
 	audio_spec.userdata = NULL;
 
+	/* In LIBRETRO builds we don't open native audio devices. Instead, tell
+	 * the libretro bridge the sample rate and allocate the mixing buffer.
+	 */
+#ifdef LIBRETRO
+	sheepbridge_set_sample_rate((unsigned)audio_spec.freq);
+	silence_byte = audio_spec.silence;
+	audio_frames_per_block = audio_spec.samples;
+	audio_mix_buf = (uint8*)malloc(audio_spec.size);
+	if (!audio_mix_buf) {
+		fprintf(stderr, "WARNING: Cannot allocate audio_mix_buf\n");
+		return false;
+	}
+	printf("Using LIBRETRO audio output (SDL shim), freq %d chan %d\n", audio_spec.freq, audio_spec.channels);
+	return true;
+#else
 	// Open the audio device, forcing the desired format
 	if (SDL_OpenAudio(&audio_spec, NULL) < 0) {
 		fprintf(stderr, "WARNING: Cannot open audio: %s\n", SDL_GetError());
@@ -132,6 +153,7 @@ static bool open_sdl_audio(void)
 	audio_frames_per_block = audio_spec.samples;
 	audio_mix_buf = (uint8*)malloc(audio_spec.size);
 	return true;
+#endif /* LIBRETRO */
 }
 
 static bool open_audio(void)
@@ -184,7 +206,9 @@ static void close_audio(void)
 #if defined(BINCUE)
 	CloseAudio_bincue();
 #endif
+#ifndef LIBRETRO
 	SDL_CloseAudio();
+#endif
 	free(audio_mix_buf);
 	audio_mix_buf = NULL;
 	audio_open = false;
@@ -246,19 +270,38 @@ static void stream_func(void *arg, uint8 *stream, int stream_len)
 			if (work_size == 0)
 				goto silence;
 
-			// Send data to audio device
+			// Prepare mixed PCM in audio_mix_buf
 			bool dbl = AudioStatus.channels == 2 &&
 				ReadMacInt16(apple_stream_info + scd_numChannels) == 1 &&
 				ReadMacInt16(apple_stream_info + scd_sampleSize) == 8;
 			uint8 *src = Mac2HostAddr(ReadMacInt32(apple_stream_info + scd_buffer));
-			if (dbl)
+			if (dbl) {
 				for (int i = 0; i < work_size; i += 2)
 					audio_mix_buf[i] = audio_mix_buf[i + 1] = src[i >> 1];
-			else memcpy(audio_mix_buf, src, work_size);
+			} else {
+				memcpy(audio_mix_buf, src, work_size);
+			}
+
+#ifdef LIBRETRO
+			/* Forward mixed PCM into libretro bridge via the shim.
+			 * work_size is bytes. Determine sample size & channels from AudioStatus.
+			 */
+			int sample_size_bytes = (AudioStatus.sample_size >> 3);
+			int channels = AudioStatus.channels ? AudioStatus.channels : 2;
+			if (sample_size_bytes <= 0) sample_size_bytes = 2;
+			size_t frames = (size_t)work_size / ((size_t)sample_size_bytes * (size_t)channels);
+
+			if (sample_size_bytes == 2 && channels == 2) {
+				send_s16_stereo_to_host((const int16_t *)audio_mix_buf, frames);
+			} else {
+				send_audio_to_host(audio_mix_buf, frames, sample_size_bytes, channels);
+			}
+			D(bug("stream: forwarded %zu frames to libretro bridge\n", frames));
+#else
 			memset((uint8 *)stream, silence_byte, stream_len);
 			SDL_MixAudio(stream, audio_mix_buf, work_size, get_audio_volume());
-
 			D(bug("stream: data written\n"));
+#endif
 
 		} else
 			goto silence;
@@ -327,11 +370,8 @@ bool audio_set_channels(int index)
 	return open_audio();
 }
 
-
 /*
- *  Get/set volume controls (volume values received/returned have the left channel
- *  volume in the upper 16 bits and the right channel volume in the lower 16 bits;
- *  both volumes are 8.8 fixed point values with 0x0100 meaning "maximum volume"))
+ *  Get/set volume controls
  */
 
 bool audio_get_main_mute(void)
@@ -386,34 +426,4 @@ static int get_audio_volume() {
 	return main_volume * speaker_volume * SDL_MIX_MAXVOLUME / (MAC_MAX_VOLUME * MAC_MAX_VOLUME);
 }
 
-#if SDL_VERSION_ATLEAST(2,0,0)
-static int play_startup(void *arg) {
-	SDL_AudioSpec wav_spec;
-	Uint8 *wav_buffer;
-	Uint32 wav_length;
-	if (SDL_LoadWAV("startup.wav", &wav_spec, &wav_buffer, &wav_length)) {
-		SDL_AudioSpec obtained;
-		SDL_AudioDeviceID deviceId = SDL_OpenAudioDevice(NULL, 0, &wav_spec, &obtained, 0);
-		if (deviceId) {
-			SDL_QueueAudio(deviceId, wav_buffer, wav_length);
-			SDL_PauseAudioDevice(deviceId, 0);
-			while (SDL_GetQueuedAudioSize(deviceId)) SDL_Delay(10);
-			SDL_Delay(500);
-			SDL_CloseAudioDevice(deviceId);
-		}
-		else printf("play_startup: Audio driver failed to initialize\n");
-		SDL_FreeWAV(wav_buffer);
-	}
-	return 0;
-}
-
-void PlayStartupSound() {
-	SDL_CreateThread(play_startup, "", NULL);
-}
-#else
-void PlayStartupSound() {
-    // Not implemented
-}
-#endif
 #endif	// SDL_VERSION_ATLEAST
-
