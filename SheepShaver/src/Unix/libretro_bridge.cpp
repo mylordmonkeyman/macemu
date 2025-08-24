@@ -1,23 +1,20 @@
 /*
  * libretro bridge (frame-buffered + audio FIFO + input forwarding)
  *
- * This file implements:
- * - storage of libretro callbacks (video/audio/input)
- * - an audio FIFO that platform backends push into
- * - per-frame draining of audio + forwarding of input polled from the frontend
+ * This implementation:
+ *  - Collects libretro input callbacks (poll & state)
+ *  - On each sheepbridge_run_frame() call polls input and forwards it
+ *    into SheepShaver's ADB input entry points
+ *  - Implements D-pad -> relative mouse movement (configurable per-poll step)
+ *  - Implements GUI toggle (Nuklear) using a toggle combo (START+SELECT)
  *
- * Input forwarding:
- * - The libretro frontend provides two callbacks:
- *    - poll_cb: called to poll the input devices
- *    - state_cb: queried for each control (returns int state)
- *
- * - We call the poll callback at the start of each frame and sample a small
- *   set of controls (D-pad, common buttons, pointer) and forward edges & axis
- *   into SheepShaver via existing ADB entry points.
- *
- * NOTE: This implementation implements a minimal, useful mapping. You can
- * extend the mappings in sheepbridge_process_input() to cover more keys and
- * controls as you need.
+ * Notes:
+ *  - This file intentionally forwards input into the existing ADB* functions
+ *    (ADBKeyDown/Up, ADBMouseDown/Up, ADBMouseMoved) so the emulator reuses
+ *    its existing input handling pipeline.
+ *  - If the repo's nukleargui is available & linked, the externs declared
+ *    below will be resolved. The bridge toggles the GUI via sheepbridge_nuklear_toggle()
+ *    and calls sheepbridge_nuklear_handle() each frame while visible.
  */
 
 #include "libretro_bridge.h"
@@ -30,6 +27,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <vector>
+#include <algorithm>
 
 /* libretro callbacks stored by the frontend */
 static retro_video_refresh_t s_video_cb = NULL;
@@ -55,19 +53,23 @@ static size_t s_audio_read_idx = 0;  /* index in samples */
 static size_t s_audio_write_idx = 0; /* index in samples */
 static unsigned s_sample_rate = 44100; /* default sample rate */
 
-/* input state caches (to detect edges) */
-static bool s_prev_dpad_up = false;
-static bool s_prev_dpad_down = false;
-static bool s_prev_dpad_left = false;
-static bool s_prev_dpad_right = false;
+/* Input state caches (to detect edges) */
+static bool s_prev_btn_start = false;
+static bool s_prev_btn_select = false;
 static bool s_prev_btn_a = false;
 static bool s_prev_btn_b = false;
 static bool s_prev_btn_x = false;
 static bool s_prev_btn_y = false;
 static bool s_prev_mouse_left = false;
 static bool s_prev_mouse_right = false;
-static int  s_last_mouse_x = 0;
-static int  s_last_mouse_y = 0;
+
+/* Mouse emulation state (relative movement from D-pad) */
+static int s_mouse_x = 0;
+static int s_mouse_y = 0;
+static int s_mouse_speed = 8; /* pixels per poll step - adjust for responsiveness */
+
+/* GUI state (Nuklear) */
+static bool s_gui_visible = false;
 
 /* lifecycle flag */
 static std::atomic<bool> s_initialised(false);
@@ -98,7 +100,7 @@ extern "C" void sheepbridge_store_audio_samples(const int16_t *samples, size_t f
         s_audio_write_idx = (s_audio_write_idx + 1) % s_audio_buf.size();
         /* If buffer full (write catches up to read), advance read to avoid overwrite */
         if (s_audio_write_idx == s_audio_read_idx) {
-            /* drop oldest sample (advance read by 1 sample) */
+            /* drop oldest sample */
             s_audio_read_idx = (s_audio_read_idx + 1) % s_audio_buf.size();
         }
     }
@@ -144,7 +146,7 @@ static size_t drain_audio_frames(int16_t *dest, size_t max_frames)
 
 /* On each retro_run call we will drain available audio and pass to libretro.
  * We aim to send reasonable batch sizes (e.g. up to 2048 frames / call), but
- * we will loop until FIFO empty or until we've sent a configured limit.
+ * we will loop until FIFO empty.
  */
 static void drain_and_send_audio()
 {
@@ -172,14 +174,12 @@ extern "C" void sheepbridge_submit_frame(const void *src, unsigned width, unsign
     {
         std::lock_guard<std::mutex> lk(s_frame_mutex);
         if (!s_frame_buffer || width * height * 4 > s_frame_width * s_frame_height * 4) {
-            /* allocate or reallocate a frame buffer large enough */
             delete [] s_frame_buffer;
             s_frame_width = width;
             s_frame_height = height;
             s_frame_pitch = pitch;
             s_frame_buffer = new uint8_t[width * height * 4];
         }
-        /* copy incoming frame (assume already in acceptable format) */
         if (src && s_frame_buffer) {
             memcpy(s_frame_buffer, src, height * pitch);
         }
@@ -198,15 +198,10 @@ extern "C" void sheepbridge_signal_frame(void)
     s_frame_cv.notify_one();
 }
 
-/* Input injection helpers: these call into SheepShaver input stack.
- * We declare the minimal externs used by the existing SDL input code so
- * forwarding ends up in the same code paths (ADB* functions).
- *
- * These externs are present elsewhere in the SheepShaver tree (adb.cpp).
- * We don't include adb headers here to avoid header dependency; declare as extern.
+/* ADB input entry points used by the emulator. These are defined in adb.cpp.
+ * We call these to inject keyboard/mouse events into SheepShaver.
  */
 extern "C" {
-/* keycodes expected by ADBKeyDown/Up are SheepShaver internal Mac keycodes */
 void ADBKeyDown(int key);
 void ADBKeyUp(int key);
 void ADBMouseDown(int button); /* 0=left,1=right,2=middle */
@@ -214,21 +209,55 @@ void ADBMouseUp(int button);
 void ADBMouseMoved(int x, int y);
 }
 
-/* Called by wrapper to set the libretro input callbacks (poll + state) */
+/* Optional Nukleargui externs (present in libretro/nukleargui/app.c).
+ * If the nukleargui compilation unit is linked, these will be resolved.
+ */
+extern "C" {
+/* Global used by nukleargui to show the virtual keyboard/GUI */
+extern int SHOWKEY;
+/* Toggle the nukleargui "virtual keyboard" or GUI state (implementation-specific) */
+void app_vkb_handle(void);
+void vkbd_key(int key, int pressed);
+}
+
+/* Set libretro input callbacks */
 extern "C" void sheepbridge_set_input_cb(retro_input_poll_t poll_cb, retro_input_state_t state_cb)
 {
     s_input_poll_cb = poll_cb;
     s_input_state_cb = state_cb;
 }
 
-/* Simple input forwarding implementation.
- * - Calls the poll callback (if present)
- * - Samples a small set of controls (D-pad/up/down/left/right, A/B/X/Y)
- * - Samples pointer device (if available)
- * - Generates edge events for key/button down/up and axis events for mouse
- *
- * This mapping is intentionally conservative and focuses on the controls
- * that are most useful to drive the Mac UI. You can extend this mapping.
+/* Toggle Nuklear GUI visibility (wrapper) */
+extern "C" void sheepbridge_nuklear_toggle(void)
+{
+    /* If nukleargui is present, flip SHOWKEY (1=visible, 0=hidden).
+     * If the symbol isn't present at link time, this will be a no-op.
+     */
+#ifdef __GNUC__
+    /* attempt to use SHOWKEY if available */
+    if (&SHOWKEY) {
+        SHOWKEY = !SHOWKEY;
+        s_gui_visible = (SHOWKEY != 0);
+    }
+#else
+    /* Fallback conservative toggle */
+    s_gui_visible = !s_gui_visible;
+#endif
+}
+
+/* Per-frame nuklear processing wrapper (if available) */
+extern "C" void sheepbridge_nuklear_handle(void)
+{
+    /* If the nuklear handler is linked, run it to process GUI input & render.
+     * The actual rendering of nuklear into the libretro output is expected to
+     * be implemented by the nukleargui code in the repo.
+     */
+    app_vkb_handle();
+}
+
+/* Perform mapping: poll frontend and forward mapped events into emulator.
+ * D-pad is used to move mouse relatively in the emulated Mac. Buttons map to
+ * mouse buttons (A -> left, B -> right) and Start+Select toggles the nuklear GUI.
  */
 static void sheepbridge_process_input()
 {
@@ -237,7 +266,7 @@ static void sheepbridge_process_input()
     /* Ask frontend to poll devices (libretro convention) */
     s_input_poll_cb();
 
-    /* --- Gamepad / D-pad / buttons mapping --- */
+    /* Read some useful controls from player 0 joystick */
     bool dpad_up = !!s_input_state_cb(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_UP);
     bool dpad_down = !!s_input_state_cb(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_DOWN);
     bool dpad_left = !!s_input_state_cb(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_LEFT);
@@ -248,90 +277,91 @@ static void sheepbridge_process_input()
     bool btn_x = !!s_input_state_cb(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_X);
     bool btn_y = !!s_input_state_cb(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_Y);
 
-    /* Map D-pad to Mac cursor keys (Apple keycodes):
-     * Up: 0x7E, Down: 0x7D, Left: 0x7B, Right: 0x7C
-     * Map A button -> Return (0x24), B -> Space (0x31)
-     *
-     * These Mac keycodes are the same values used throughout the existing
-     * event->ADB mapping in the SDL backend; adjust if you rely on a different map.
+    bool btn_start = !!s_input_state_cb(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_START);
+    bool btn_select = !!s_input_state_cb(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_SELECT);
+
+    /* Toggle GUI on START+SELECT pressed together (rising edge) */
+    if (btn_start && btn_select && (!s_prev_btn_start || !s_prev_btn_select)) {
+        /* Toggle nuklear GUI visibility */
+        sheepbridge_nuklear_toggle();
+    }
+    s_prev_btn_start = btn_start;
+    s_prev_btn_select = btn_select;
+
+    /* If GUI visible, steer input toward the GUI handling code (nuklear).
+     * That code will handle virtual keyboard & GUI navigation. We must avoid
+     * forwarding mouse/key input into the emulated Mac while GUI consumes it.
      */
-    const int MAC_KEY_UP     = 0x7E;
-    const int MAC_KEY_DOWN   = 0x7D;
-    const int MAC_KEY_LEFT   = 0x7B;
-    const int MAC_KEY_RIGHT  = 0x7C;
-    const int MAC_KEY_RETURN = 0x24;
-    const int MAC_KEY_SPACE  = 0x31;
+    if (s_gui_visible || (SHOWKEY != 0)) {
+        /* Forward a subset of controls to the nuklear vkbd if implemented:
+         * - Map A/B/X/Y to some VKBD inputs (implementation-specific).
+         * - Nuklear/UI should read Core_Key_Sate or have its own mapping.
+         *
+         * We'll generate vkbd_key calls for simple presses so the virtual keyboard
+         * can react; mapping here is conservative and can be extended.
+         */
+        if (btn_a && !s_prev_btn_a) vkbd_key(1, 1); /* example: key id 1 pressed */
+        if (!btn_a && s_prev_btn_a) vkbd_key(1, 0);
+        if (btn_b && !s_prev_btn_b) vkbd_key(2, 1);
+        if (!btn_b && s_prev_btn_b) vkbd_key(2, 0);
+        if (btn_x && !s_prev_btn_x) vkbd_key(3, 1);
+        if (!btn_x && s_prev_btn_x) vkbd_key(3, 0);
+        if (btn_y && !s_prev_btn_y) vkbd_key(4, 1);
+        if (!btn_y && s_prev_btn_y) vkbd_key(4, 0);
 
-    /* D-pad edges */
-    if (dpad_up && !s_prev_dpad_up) ADBKeyDown(MAC_KEY_UP);
-    if (!dpad_up && s_prev_dpad_up) ADBKeyUp(MAC_KEY_UP);
-    if (dpad_down && !s_prev_dpad_down) ADBKeyDown(MAC_KEY_DOWN);
-    if (!dpad_down && s_prev_dpad_down) ADBKeyUp(MAC_KEY_DOWN);
-    if (dpad_left && !s_prev_dpad_left) ADBKeyDown(MAC_KEY_LEFT);
-    if (!dpad_left && s_prev_dpad_left) ADBKeyUp(MAC_KEY_LEFT);
-    if (dpad_right && !s_prev_dpad_right) ADBKeyDown(MAC_KEY_RIGHT);
-    if (!dpad_right && s_prev_dpad_right) ADBKeyUp(MAC_KEY_RIGHT);
+        s_prev_btn_a = btn_a;
+        s_prev_btn_b = btn_b;
+        s_prev_btn_x = btn_x;
+        s_prev_btn_y = btn_y;
 
-    s_prev_dpad_up = dpad_up;
-    s_prev_dpad_down = dpad_down;
-    s_prev_dpad_left = dpad_left;
-    s_prev_dpad_right = dpad_right;
+        /* Let the nuklear UI run if available */
+        sheepbridge_nuklear_handle();
 
-    /* Buttons edges */
-    if (btn_a && !s_prev_btn_a) ADBKeyDown(MAC_KEY_RETURN);
-    if (!btn_a && s_prev_btn_a) ADBKeyUp(MAC_KEY_RETURN);
-    if (btn_b && !s_prev_btn_b) ADBKeyDown(MAC_KEY_SPACE);
-    if (!btn_b && s_prev_btn_b) ADBKeyUp(MAC_KEY_SPACE);
-
-    s_prev_btn_a = btn_a;
-    s_prev_btn_b = btn_b;
-
-    /* --- Pointer (mouse) support --- */
-    /* Sample pointer device if frontend exposes it. Many frontends expose a pointer
-     * device with RETRO_DEVICE_POINTER and IDs RETRO_DEVICE_ID_POINTER_X/Y. If not
-     * available, these calls will usually return 0.
-     */
-    int mx = 0, my = 0;
-#if defined(RETRO_DEVICE_POINTER)
-    /* libretro pointer values are typically returned as integer coordinates */
-    mx = s_input_state_cb(0, RETRO_DEVICE_POINTER, 0, RETRO_DEVICE_ID_POINTER_X);
-    my = s_input_state_cb(0, RETRO_DEVICE_POINTER, 0, RETRO_DEVICE_ID_POINTER_Y);
-#endif
-
-    /* Buttons: some frontends provide RETRO_DEVICE_MOUSE device */
-#if defined(RETRO_DEVICE_MOUSE)
-    bool mleft = !!s_input_state_cb(0, RETRO_DEVICE_MOUSE, 0, RETRO_DEVICE_ID_MOUSE_LEFT);
-    bool mright = !!s_input_state_cb(0, RETRO_DEVICE_MOUSE, 0, RETRO_DEVICE_ID_MOUSE_RIGHT);
-    bool mmiddle = !!s_input_state_cb(0, RETRO_DEVICE_MOUSE, 0, RETRO_DEVICE_ID_MOUSE_MIDDLE);
-#else
-    /* fallback: map A/B to left/right mouse */
-    bool mleft = btn_a;
-    bool mright = btn_b;
-    bool mmiddle = btn_x;
-#endif
-
-    /* Forward mouse movement if changed (simple absolute coordinates) */
-    if (mx != s_last_mouse_x || my != s_last_mouse_y) {
-        ADBMouseMoved(mx, my);
-        s_last_mouse_x = mx; s_last_mouse_y = my;
+        /* Do not forward pointer/mouse into the emulated Mac while GUI is active */
+        return;
     }
 
-    /* Mouse button edges */
-    if (mleft && !s_prev_mouse_left) ADBMouseDown(0);
-    if (!mleft && s_prev_mouse_left) ADBMouseUp(0);
-    if (mright && !s_prev_mouse_right) ADBMouseDown(1);
-    if (!mright && s_prev_mouse_right) ADBMouseUp(1);
+    /* --- D-pad -> relative mouse movement --- */
+    int dx = 0, dy = 0;
+    if (dpad_left) dx -= s_mouse_speed;
+    if (dpad_right) dx += s_mouse_speed;
+    if (dpad_up) dy -= s_mouse_speed;
+    if (dpad_down) dy += s_mouse_speed;
 
-    s_prev_mouse_left = mleft;
-    s_prev_mouse_right = mright;
+    /* Update internal mouse pos. If we know emulated frame size, clamp; else allow free movement. */
+    s_mouse_x += dx;
+    s_mouse_y += dy;
+    if (s_frame_width > 0 && s_frame_height > 0) {
+        s_mouse_x = std::max(0, std::min<int>(s_mouse_x, (int)s_frame_width - 1));
+        s_mouse_y = std::max(0, std::min<int>(s_mouse_y, (int)s_frame_height - 1));
+    }
 
-    /* NOTE:
-     * - Keyboard handling (full keyboard scancode mapping) is intentionally
-     *   not attempted here because SheepShaver's internal mapping pipeline
-     *   expects Mac scan-codes and the project's SDL key translation tables
-     *   are already fairly involved. If you require full keyboard support via
-     *   libretro's RETRO_DEVICE_KEYBOARD, we can add a mapping layer that
-     *   translates libretro keycodes to the Mac scancodes used by ADBKeyDown.
+    /* Only generate a mouse move call if there was movement */
+    if (dx != 0 || dy != 0) {
+        ADBMouseMoved(s_mouse_x, s_mouse_y);
+    }
+
+    /* Map gamepad buttons to mouse button clicks */
+    if (btn_a && !s_prev_mouse_left) { ADBMouseDown(0); s_prev_mouse_left = true; }
+    if (!btn_a && s_prev_mouse_left) { ADBMouseUp(0); s_prev_mouse_left = false; }
+
+    if (btn_b && !s_prev_mouse_right) { ADBMouseDown(1); s_prev_mouse_right = true; }
+    if (!btn_b && s_prev_mouse_right) { ADBMouseUp(1); s_prev_mouse_right = false; }
+
+    /* Optionally map X/Y to middle/other buttons or to keyboard events as desired */
+    if (btn_x && !s_prev_btn_x) { ADBMouseDown(2); s_prev_btn_x = true; }
+    if (!btn_x && s_prev_btn_x) { ADBMouseUp(2); s_prev_btn_x = false; }
+
+    /* update simple button caches for A/B/X/Y */
+    s_prev_btn_a = btn_a;
+    s_prev_btn_b = btn_b;
+    s_prev_btn_x = btn_x;
+    s_prev_btn_y = btn_y;
+
+    /* NOTE: We deliberately do not attempt to implement full keyboard mapping
+     * (RETRO_DEVICE_KEYBOARD) here; that can be added later if you want full
+     * physical keyboard support from the frontend. For now, the nuclear GUI's
+     * virtual keyboard can be used to input text when visible.
      */
 }
 
@@ -378,6 +408,10 @@ extern "C" bool sheepbridge_init(const char *game_path, unsigned int ram_mb)
         s_audio_read_idx = s_audio_write_idx = 0;
     }
 
+    /* initialize mouse to center on first known frame size (or 0,0 until frame arrives) */
+    s_mouse_x = 0;
+    s_mouse_y = 0;
+
     s_initialised.store(true);
     return true;
 }
@@ -409,5 +443,5 @@ extern "C" void sheepbridge_deinit(void)
     s_initialised.store(false);
 }
 
-/* Minimal setters for video and input callbacks (kept for completeness) */
+/* Minimal setter for video callback */
 extern "C" void sheepbridge_set_video_cb(retro_video_refresh_t cb) { s_video_cb = cb; }

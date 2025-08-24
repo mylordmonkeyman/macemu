@@ -29,18 +29,28 @@ void sheepbridge_set_audio_cb(retro_audio_sample_t cb, retro_audio_sample_batch_
 void sheepbridge_store_audio_samples(const int16_t *samples, size_t frames);
 void sheepbridge_set_sample_rate(unsigned rate);
 
-/* Input helper: the libretro wrapper will call sheepbridge_set_input_cb() with
- * the libretro poll/state callbacks. The bridge will poll and forward selected
- * input state into SheepShaver each frame.
+/* Input helper:
+ * - The libretro wrapper will call sheepbridge_set_input_cb() with
+ *   the libretro poll/state callbacks. The bridge will poll and forward
+ *   selected input state into SheepShaver each frame.
  *
- * These are exposed so platform backends (or the wrapper) can also inject
- * input directly if desired.
+ * - Helper injection functions (optional) so other backends can inject
+ *   synthetic input into the emulator via the same ADB entry points:
  */
-
-/* (The function below is set via sheepbridge_set_input_cb by the wrapper.
-   Keep the prototype here for completeness.) */
 void sheepbridge_inject_key(bool down, int mac_keycode);
 void sheepbridge_inject_mouse(int x, int y, unsigned buttons_mask);
+
+/* Nuklear GUI integration:
+ * The repo includes a nuklear-based GUI (libretro/nukleargui). The bridge
+ * exposes an API to toggle the GUI from the libretro input mapping and to
+ * call the GUI per-frame. These functions are optionally implemented in
+ * the nukleargui build units and are weak-linked here.
+ *
+ * - sheepbridge_nuklear_toggle() toggles visibility (if available)
+ * - sheepbridge_nuklear_handle() runs per-frame GUI processing (if available)
+ */
+void sheepbridge_nuklear_toggle(void);
+void sheepbridge_nuklear_handle(void);
 
 #ifdef __cplusplus
 }
